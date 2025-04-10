@@ -59,6 +59,8 @@ class EdgeState:
     edge_id: str
     sequence_id: int
     released: bool
+    start_node_id: str  # Added start node ID
+    end_node_id: str    # Added end node ID
     edge_description: Optional[str] = None
     trajectory: Optional[Trajectory] = None
     
@@ -66,7 +68,9 @@ class EdgeState:
         result = {
             "edgeId": self.edge_id,
             "sequenceId": self.sequence_id,
-            "released": self.released
+            "released": self.released,
+            "startNodeId": self.start_node_id, # Added for completeness if needed
+            "endNodeId": self.end_node_id,     # Added for completeness if needed
         }
         if self.edge_description is not None:
             result["edgeDescription"] = self.edge_description

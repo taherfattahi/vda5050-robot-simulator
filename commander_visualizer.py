@@ -5,13 +5,11 @@ import json
 import time
 import uuid
 import datetime
-import threading  # To run MQTT loop and visualization concurrently
+import threading
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import math
 
-# --- Import necessary components from your project ---
-# (Make sure these paths are correct relative to where you run this script)
 import config  # To get broker details and config
 import mqtt_utils # For base topic generation
 import utils # For timestamp
@@ -30,6 +28,11 @@ mqtt_client = None
 robot_serial_numbers = [f"{config_data.vehicle.serial_number}{i}" for i in range(config_data.settings.robot_count)]
 base_topics = {} # {serial_number: base_topic_string}
 
+dropped_package_locations = [] # List to store (x, y) of dropped packages
+drop_plot_object = None # Matplotlib plot object for dropped packages
+
+path_plot_object = None 
+
 # Plotting variables
 fig, ax = None, None
 scatter_plots = {} # {serial_number: plot_object}
@@ -37,7 +40,6 @@ text_labels = {} # {serial_number: text_object}
 
 
 # --- MQTT Functions ---
-
 def get_robot_base_topic(serial_number):
     """Generates the VDA5050 base topic for a specific robot."""
     return mqtt_utils.generate_vda_mqtt_base_topic(
@@ -60,8 +62,6 @@ def on_connect(client, userdata, flags, rc, properties=None):
 def on_message(client, userdata, msg):
     topic = msg.topic
     payload = msg.payload.decode('utf-8')
-    print(f"Received message on {topic}")
-    print(f"Received message on {payload}")
 
     # Identify the robot and topic type
     topic_parts = topic.split('/')
@@ -109,7 +109,6 @@ def setup_mqtt():
 
 
 # --- Command Sending Functions ---
-
 def send_instant_action(serial_number, action_type, params={}, blocking_type=BlockingType.HARD):
     """Sends an InstantAction command to a specific robot."""
     if not mqtt_client:
@@ -153,6 +152,8 @@ def send_order(serial_number, order_id, nodes_data, edges_data):
      nodes_data: list of dicts like {'node_id': 'N1', 'x': 1.0, 'y': 2.0, 'actions': []}
      edges_data: list of dicts like {'edge_id': 'E1', 'start_node_id': 'N1', 'end_node_id': 'N2'}
      """
+     global dropped_package_locations # Allow modification
+
      if not mqtt_client:
         print("MQTT client not connected.")
         return
@@ -163,35 +164,66 @@ def send_order(serial_number, order_id, nodes_data, edges_data):
         return
 
      nodes = []
-     sequence_id_counter = 0
-     for i, n_data in enumerate(nodes_data):
+     edges = []
+     sequence_id_counter = 0 # Reset for each order
+
+     # --- >> PROCESS NODES WITH ACTIONS << ---
+     for n_data in nodes_data:
           sequence_id_counter += 1
-          # TODO: Add parsing for actions within nodes if needed
+          node_actions = []
+          # Check if actions are defined for this node
+          for act_data in n_data.get('actions', []):
+               action_params = [ActionParameter(key=k, value=ActionParameterValue(v))
+                                for k, v in act_data.get('action_parameters', {}).items()]
+               node_actions.append(Action(
+                    action_type=act_data['action_type'],
+                    action_id=act_data.get('action_id', str(uuid.uuid4())), # Generate ID if missing
+                    blocking_type=act_data.get('blocking_type', BlockingType.HARD),
+                    action_parameters=action_params,
+                    action_description=act_data.get('action_description')
+               ))
+               # --- If it's a dropOff action, record location for visualization ---
+               if act_data['action_type'] == 'dropOff':
+                    drop_loc = (n_data['x'], n_data['y'])
+                    if drop_loc not in dropped_package_locations:
+                         print(f"VISUALIZER: Recording drop-off location for {serial_number} at {drop_loc}")
+                         dropped_package_locations.append(drop_loc)
+               # --- End dropOff recording ---
+
+          # Create NodePosition object
+          node_pos = NodePosition(
+               x=n_data['x'],
+               y=n_data['y'],
+               map_id=config_data.settings.map_id
+               # Add theta, deviations etc. if needed
+          )
+
+          # Create the Node object
           nodes.append(Node(
                node_id=n_data['node_id'],
                sequence_id=sequence_id_counter,
-               released=True, # Assume nodes are initially released
-               node_position=NodePosition(
-                    x=n_data['x'],
-                    y=n_data['y'],
-                    map_id=config_data.settings.map_id # Use map from config
-               ),
-               actions=[] # Add actions here if needed
+               released=n_data.get('released', True), # Default to True
+               node_description=n_data.get('node_description'),
+               node_position=node_pos,
+               actions=node_actions # Add the parsed/created actions
           ))
+     # --- >> END NODE PROCESSING << ---
 
-     edges = []
-     for i, e_data in enumerate(edges_data):
+     # --- >> PROCESS EDGES (assuming no actions on edges for now) << ---
+     for e_data in edges_data:
           sequence_id_counter += 1
-           # TODO: Add parsing for actions within edges if needed
           edges.append(Edge(
                edge_id=e_data['edge_id'],
                sequence_id=sequence_id_counter,
                start_node_id=e_data['start_node_id'],
                end_node_id=e_data['end_node_id'],
-               released=True,
-               actions=[] # Add actions here if needed
+               released=e_data.get('released', True),
+               actions=[] # Add edge action parsing if needed later
+               # Add maxSpeed etc. if needed
           ))
+     # --- >> END EDGE PROCESSING << ---
 
+     # Create the final Order object
      order_cmd = Order(
           header_id=0, # Manage header IDs
           timestamp=utils.get_timestamp(),
@@ -204,61 +236,83 @@ def send_order(serial_number, order_id, nodes_data, edges_data):
           edges=edges
      )
 
+     # Send the order
      topic = f"{base_topic}/order"
-     payload = json.dumps(order_cmd.to_dict())
+     payload = json.dumps(order_cmd.to_dict(), indent=4) # Added indent for readability
 
-     print(f"Sending to {topic}: {payload}")
+     print(f"Sending order to {topic}") # Payload might be too long for console
      result = mqtt_client.publish(topic, payload=payload, qos=1)
-     print(f"Publish result: {result.rc}")
-
+     print(f"Publish result for order {order_id}: {result.rc}")
 
 # --- Visualization Functions ---
-
 def init_plot():
     """Initializes the Matplotlib plot axes and elements."""
-    # --- >> REMOVE: fig, ax = plt.subplots() << ---  (This line is moved)
+    global drop_plot_object, path_plot_object
     ax.set_xlabel("X Coordinate")
     ax.set_ylabel("Y Coordinate")
-    ax.set_title("Robot Positions")
+    ax.set_title("Robot Positions & Path")
     ax.grid(True)
-    # Set initial plot limits (adjust as needed)
-    ax.set_xlim(-10, 10)
-    ax.set_ylim(-10, 10)
-    ax.set_aspect('equal', adjustable='box') # Make axes scale equally
+    ax.set_xlim(-1, 7)
+    ax.set_ylim(-1, 7)
+    ax.set_aspect('equal', adjustable='box')
 
-    # Create plot objects for each robot
     initial_artists = []
-    for serial in robot_serial_numbers:
-        # Initial dummy plot points, updated later
-        scatter, = ax.plot([], [], marker='o', linestyle='', markersize=8, label=serial)
-        scatter_plots[serial] = scatter
-        # Add text label near the plot point
-        text = ax.text(0, 0, serial[-2:], fontsize=8, ha='center', va='bottom') # Show last 2 chars
-        text_labels[serial] = text
-        initial_artists.extend([scatter, text]) # Add elements to return for blitting
 
-    ax.legend()
-    return initial_artists # Return iterable of artists created
+    # Path Visualization
+    path_x = [node['x'] for node in node_data_template]
+    path_y = [node['y'] for node in node_data_template]
+    path_line, = ax.plot(path_x, path_y, marker='s',
+                         linestyle='--', color='grey', linewidth=1, label='Path') # Label added once here
+    path_plot_object = path_line
+    initial_artists.append(path_plot_object)
+
+    # Robot plots
+    robot_handles = [] # Store handles for legend
+    for serial in robot_serial_numbers:
+        scatter, = ax.plot([], [], marker='o', linestyle='', markersize=8, label=serial) # Label per robot instance
+        scatter_plots[serial] = scatter
+        text = ax.text(0, 0, serial[-2:], fontsize=8, ha='center', va='bottom')
+        text_labels[serial] = text
+        initial_artists.extend([scatter, text])
+        robot_handles.append(scatter) # Collect scatter plot handles
+
+    # Plot for Dropped Packages
+    drop_plot, = ax.plot([], [], marker='x', color='red', linestyle='', markersize=7, label='DropOff') # Label added once here
+    drop_plot_object = drop_plot
+    initial_artists.append(drop_plot_object)
+
+    ax.legend(loc='upper left', bbox_to_anchor=(1.02, 1), borderaxespad=0.)
+
+    return initial_artists
 
 def update_plot(frame):
     """Called periodically by FuncAnimation to update the plot."""
     updates = []
+    # Update robots
     for serial, plot_obj in scatter_plots.items():
         if serial in robot_positions:
             x, y, theta = robot_positions[serial]
-            plot_obj.set_data([x], [y]) # Update scatter plot position
-            text_labels[serial].set_position((x, y + 0.2)) # Update text label position slightly above
+            plot_obj.set_data([x], [y])
+            text_labels[serial].set_position((x, y + 0.2))
             updates.append(plot_obj)
             updates.append(text_labels[serial])
         else:
-            # Keep robots without position data hidden initially
              plot_obj.set_data([], [])
-             text_labels[serial].set_position((0, -1000)) # Move text off-screen
+             text_labels[serial].set_position((0, -1000))
+
+    # Update Dropped Packages
+    if drop_plot_object is not None and dropped_package_locations:
+         drop_x = [loc[0] for loc in dropped_package_locations]
+         drop_y = [loc[1] for loc in dropped_package_locations]
+         drop_plot_object.set_data(drop_x, drop_y)
+         updates.append(drop_plot_object)
+
+    # The path plot (path_plot_object) is static, so it doesn't need to be returned here for blitting updates.
+    # If blit=True causes issues, you might need to return all artists including path_plot_object.
+
     return updates
 
-
 # --- Main Execution ---
-
 if __name__ == "__main__":
     print("Starting Commander and Visualizer...")
     setup_mqtt()
@@ -268,44 +322,67 @@ if __name__ == "__main__":
         exit()
 
     print("MQTT Client Setup Complete.")
+    time.sleep(2)
 
-    # --- Example Commands (Uncomment to send) ---
-    time.sleep(2) # Wait for connection and subscriptions
+    # --- >> REVERT to Square Path Definition << ---
+    start_pos = (0.0, 0.0)
+    station1_pos = (5.0, 0.0) # Station 1 at corner
+    corner2_pos = (5.0, 5.0)
+    station2_pos = (0.0, 5.0) # Station 2 at corner
 
-    # Example: Send an instant action to initialize position of robot 0
-    print("\nSending initPosition action...")
-    send_instant_action(
-        robot_serial_numbers[0],
-        "initPosition",
-        params={"x": 1.0, "y": 1.0, "theta": 0.0, "mapId": config_data.settings.map_id}
-    )
-    time.sleep(1)
-
-    # Example: Send a simple order to robot 0 to move between two points
-    print("\nSending simple order...")
-    node_list = [
-        {'node_id': 'start_node', 'x': 1.0, 'y': 1.0},
-        {'node_id': 'end_node', 'x': 5.0, 'y': 3.0}
+    # Define Nodes for the square path
+    node_data_template = [
+        {'node_id': 'N_Start', 'x': start_pos[0], 'y': start_pos[1], 'actions': []},
+        {'node_id': 'N_Station1', 'x': station1_pos[0], 'y': station1_pos[1], 'actions': [
+            {'action_type': 'dropOff', 'action_id': 'act_drop1', 'blocking_type': BlockingType.HARD}
+        ]},
+        {'node_id': 'N_Corner2', 'x': corner2_pos[0], 'y': corner2_pos[1], 'actions': []},
+        {'node_id': 'N_Station2', 'x': station2_pos[0], 'y': station2_pos[1], 'actions': [
+            {'action_type': 'dropOff', 'action_id': 'act_drop2', 'blocking_type': BlockingType.HARD}
+        ]},
+         # Close the loop by going back to the start coordinates
+        {'node_id': 'N_EndLoop', 'x': start_pos[0], 'y': start_pos[1], 'actions': []}
     ]
-    edge_list = [
-        {'edge_id': 'move_edge', 'start_node_id': 'start_node', 'end_node_id': 'end_node'}
-    ]
-    send_order(robot_serial_numbers[0], "order_" + str(uuid.uuid4()), node_list, edge_list)
-    time.sleep(1)
 
+    # Define Edges for the square path
+    edge_data_template = [
+        {'edge_id': 'E_Start_S1', 'start_node_id': 'N_Start', 'end_node_id': 'N_Station1'},
+        {'edge_id': 'E_S1_C2', 'start_node_id': 'N_Station1', 'end_node_id': 'N_Corner2'},
+        {'edge_id': 'E_C2_S2', 'start_node_id': 'N_Corner2', 'end_node_id': 'N_Station2'},
+        {'edge_id': 'E_S2_End', 'start_node_id': 'N_Station2', 'end_node_id': 'N_EndLoop'} # Edge back to start
+    ]
+    # --- >> END Path Definition Revert << ---
+
+    # --- Send Commands Loop ---
+    for index, serial in enumerate(robot_serial_numbers):
+        print(f"\n--- Preparing commands for Robot: {serial} ---")
+
+        # 1. Initialize Position (Stagger start slightly)
+        init_x = start_pos[0] + index * 0.2 # Small stagger X
+        init_y = start_pos[1] + index * 0.2 # Small stagger Y
+        print(f"Sending initPosition action to {serial} at ({init_x:.1f}, {init_y:.1f})...")
+        send_instant_action(
+            serial,
+            "initPosition",
+            params={"x": init_x, "y": init_y, "theta": 0.0, "mapId": config_data.settings.map_id}
+        )
+        time.sleep(0.5)
+
+        # 2. Create and Send the Order (Uses the square path templates now)
+        order_id = f"order_square_{serial}_{str(uuid.uuid4())[:4]}"
+        print(f"Sending square path order ({order_id}) to {serial}...")
+        # Assuming send_order is correctly modified to handle node actions
+        send_order(serial, order_id, node_data_template, edge_data_template)
+        time.sleep(1)
+    # --- End Send Commands Loop ---
 
     # --- Setup and Run Visualization ---
     print("Setting up visualization...")
-
-    # --- >> ADD: Create the figure and axes HERE << ---
     fig, ax = plt.subplots()
-
-    # Use FuncAnimation for real-time updates
-    # Now 'fig' is a valid Figure object when passed to FuncAnimation
+    # Note: init_plot now uses node_data_template defined above to draw the path
     ani = animation.FuncAnimation(fig, update_plot, init_func=init_plot,
                                   interval=100, blit=True, cache_frame_data=False)
-
-    plt.show() # Display the plot
+    plt.show()
     
     # --- Cleanup ---
     print("Stopping MQTT loop...")
