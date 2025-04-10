@@ -75,7 +75,7 @@ Python-based simulation environment for robots with VDA 5050 protocol (specifica
 
 ## Usage
 
-1.  **Start an MQTT Broker:** Ensure an MQTT broker is running and accessible based on your `config.toml`.
+1.  **Start an MQTT Broker:** Ensure an MQTT broker such as [Mosquitto](https://mosquitto.org/) is running and accessible based on your `config.toml`.
 2.  **Run the Simulator:**
     ```bash
     python main.py
