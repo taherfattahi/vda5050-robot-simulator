@@ -1,0 +1,18 @@
+[mqtt_broker]
+host = "localhost"                  # MQTT broker address
+port = "1883"                        # MQTT broker port
+vda_interface = "uagv"               # VDA interface to use
+
+[vehicle]
+serial_number = "s1"                 # Serial number of the AGV
+manufacturer = "rikeb"               # Manufacturer name
+vda_version = "v2"                   # VDA standard version
+vda_full_version = "2.0.0"           # Full VDA version
+
+[settings]
+map_id = "webots"                    # Map identifier
+state_frequency = 1                  # Frequency for state updates (in Hz)
+visualization_frequency = 1          # Frequency for visualization updates (in Hz)
+action_time = 1.0                    # Action execution time (in seconds)
+robot_count = 1                      # Number of robots to simulate
+speed = 0.05                         # Robot speed in meters per second
